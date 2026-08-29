@@ -213,6 +213,7 @@ __device__ __host__ __forceinline__ int market_price(int item, int inventory) {
 // Item space: 0..8 products (WHEAT..FERTILIZER), 9..11 animals (GOOSE, COW, SHEEP).
 constexpr int kItemCount = kProducts + kAnimals;  // 12
 
+// Compact tile: small fields as int8/int16, matching the official engine's ranges.
 struct Tile {
     uint8_t  kind;                 // TileKind
     uint8_t  crop;                 // Crop (valid if kind == T_PLANT)
@@ -225,9 +226,9 @@ struct Tile {
     int16_t  yield_units;
     int16_t  max_lifespan_step;    // plant only, -1 for ongoing crops
     int16_t  fertilized_until_day; // plant only, -1
-    int16_t  consecutive_unwatered;
-    int16_t  consecutive_unfed;
-    int16_t  pending_care_bonus;
+    int8_t   consecutive_unwatered;
+    int8_t   consecutive_unfed;
+    int8_t   pending_care_bonus;
 };
 
 struct Farm {
