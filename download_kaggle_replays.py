@@ -100,6 +100,10 @@ def latest_episode_id(submission_id: str) -> str | None:
     return None
 
 
+def replay_file(directory: Path, episode_id: str) -> Path:
+    return directory / f"episode-{episode_id}-replay.json"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--leaderboard-url", action="append", default=[], help="Optional Kaggle leaderboard URL")
@@ -114,8 +118,16 @@ def main() -> int:
     try:
         explicit_ids = [ids_from_url(url) for url in args.leaderboard_url]
         replay_ids = [(submission or episode, episode or submission) for submission, episode in explicit_ids if submission or episode]
-        ids = [submission for submission, episode in explicit_ids if submission and not episode]
-        if not ids and not episodes:
+        replay_ids = []
+        for submission_id, episode_id in explicit_ids:
+            if episode_id:
+                replay_ids.append((submission_id or episode_id, episode_id))
+            elif submission_id:
+                resolved_episode = latest_episode_id(submission_id)
+                if resolved_episode:
+                    replay_ids.append((submission_id, resolved_episode))
+            time.sleep(args.delay)
+        if not replay_ids:
             download_leaderboard(args.leaderboard)
             team_ids = leaderboard_submission_ids(args.leaderboard, args.limit)
             for team_id in team_ids:
@@ -127,19 +139,18 @@ def main() -> int:
                             episode_id = latest_episode_id(submission_id)
                             if episode_id:
                                 replay_ids.append((submission_id, episode_id))
-                            break
+                                break
+                            time.sleep(args.delay)
                 time.sleep(args.delay)
                 if len(replay_ids) >= args.limit:
                     break
             if not replay_ids:
                 raise RuntimeError("No submissions found for the leaderboard teams")
-        elif ids:
-            replay_ids.extend((submission_id, submission_id) for submission_id in ids)
-
         args.output.mkdir(parents=True, exist_ok=True)
+        replay_ids = list(dict.fromkeys(replay_ids))[:args.limit]
         for index, (submission_id, episode_id) in enumerate(replay_ids, start=1):
             target = args.output / submission_id
-            if target.exists() and any(target.iterdir()):
+            if replay_file(target, episode_id).is_file():
                 print(f"[{index}/{len(replay_ids)}] already downloaded {submission_id}")
                 continue
             target.mkdir(parents=True, exist_ok=True)
