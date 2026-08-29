@@ -63,24 +63,24 @@ def download_leaderboard(path: Path) -> None:
         raise RuntimeError(f"Kaggle CLI did not create {path}")
 
 
-def leaderboard_submission_ids(path: Path) -> list[str]:
+def leaderboard_teams(path: Path) -> list[tuple[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as stream:
         rows = csv.DictReader(stream)
         normalized = {field.lower(): field for field in rows.fieldnames or []}
         id_fields = [normalized[name.lower()] for name in ID_FIELDS if name.lower() in normalized]
-        ids: list[str] = []
+        teams: list[tuple[str, str]] = []
         for row in rows:
             value = next((row.get(field, "") for field in id_fields if row.get(field)), "")
             match = re.search(r"\d+", value)
-            if match and match.group() not in ids:
-                ids.append(match.group())
-    if not ids:
+            if match and (match.group(), row.get("Rank", "")) not in teams:
+                teams.append((row.get("Rank", ""), match.group()))
+    if not teams:
         columns = ", ".join(rows.fieldnames or [])
         raise RuntimeError(
             f"{path} has no submission IDs (columns: {columns}). "
             "The current Kaggle CLI may return teamId; the caller must resolve teams to submissions."
         )
-    return ids
+    return teams
 
 
 def json_output(args: list[str]) -> object:
@@ -115,21 +115,19 @@ def main() -> int:
 
     try:
         explicit_ids = [ids_from_url(url) for url in args.leaderboard_url]
-        replay_ids = [(submission or episode, episode or submission) for submission, episode in explicit_ids if submission or episode]
-        replay_ids = []
+        replay_ids: list[tuple[str, str, str]] = []
         for submission_id, episode_id in explicit_ids:
-            time.sleep(args.delay)
             if episode_id:
-                replay_ids.append((submission_id or episode_id, episode_id))
+                replay_ids.append(("", "", submission_id or episode_id, episode_id))
             elif submission_id:
+                time.sleep(args.delay)
                 resolved_episode = latest_episode_id(submission_id)
                 if resolved_episode:
-                    replay_ids.append((submission_id, resolved_episode))
-            time.sleep(args.delay)
+                    replay_ids.append(("", "", submission_id, resolved_episode))
         if not replay_ids:
             download_leaderboard(args.leaderboard)
-            team_ids = leaderboard_submission_ids(args.leaderboard)
-            for team_id in team_ids:
+            teams = leaderboard_teams(args.leaderboard)
+            for rank, team_id in teams:
                 time.sleep(args.delay)
                 submissions = json_output(["competitions", "team-submissions", team_id])
                 if isinstance(submissions, list):
@@ -139,7 +137,7 @@ def main() -> int:
                             time.sleep(args.delay)
                             episode_id = latest_episode_id(submission_id)
                             if episode_id:
-                                pair = (submission_id, episode_id)
+                                pair = (rank, team_id, submission_id, episode_id)
                                 if pair not in replay_ids:
                                     replay_ids.append(pair)
                             if len(replay_ids) >= args.limit:
@@ -150,7 +148,13 @@ def main() -> int:
                 raise RuntimeError("No submissions found for the leaderboard teams")
         args.output.mkdir(parents=True, exist_ok=True)
         replay_ids = list(dict.fromkeys(replay_ids))[:args.limit]
-        for index, (submission_id, episode_id) in enumerate(replay_ids, start=1):
+        manifest = args.output / "replays.csv"
+        with manifest.open("w", newline="", encoding="utf-8") as stream:
+            writer = csv.DictWriter(stream, fieldnames=["rank", "team_id", "submission_id", "episode_id", "replay_path"])
+            writer.writeheader()
+            for rank, team_id, submission_id, episode_id in replay_ids:
+                writer.writerow({"rank": rank, "team_id": team_id, "submission_id": submission_id, "episode_id": episode_id, "replay_path": str(replay_file(args.output / submission_id, episode_id))})
+        for index, (rank, team_id, submission_id, episode_id) in enumerate(replay_ids, start=1):
             target = args.output / submission_id
             if replay_file(target, episode_id).is_file():
                 print(f"[{index}/{len(replay_ids)}] already downloaded {submission_id}")
