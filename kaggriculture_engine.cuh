@@ -920,7 +920,9 @@ __device__ __host__ __forceinline__ void end_of_day(
         farm.farmer_y = static_cast<int16_t>(half - 1);
         farm.hand_count = 0;
         farm.hires_today = 0;
-        for (int i = 0; i < kItemCount; ++i) priv.inventory[0][i] = 0;
+        for (int h = 0; h < MAX_HANDS; ++h) { farm.hand_x[h] = 0; farm.hand_y[h] = 0; }
+        for (int u = 0; u <= MAX_HANDS; ++u)
+            for (int i = 0; i < kItemCount; ++i) priv.inventory[u][i] = 0;
     }
     int next_day = day + 1;
     if (next_day > 0 && next_day % shop_interval == 0) {
@@ -966,7 +968,11 @@ __device__ __host__ __forceinline__ void interpreter(
 
         // Atomic PLANT validation: if total PLANT requests for a crop exceed
         // available seeds, drop ALL PLANT requests for that crop this turn.
+        // The seed count is snapshotted once, before any planting, so later
+        // units in the same turn cannot invalidate earlier-validated plants.
         int plant_demand[kCrops] = {0,0,0,0,0};
+        int seeds_snapshot[kCrops];
+        for (int c = 0; c < kCrops; ++c) seeds_snapshot[c] = priv.seeds[c];
         int unit_count = 1 + (a.hand_count > 0 ? a.hand_count : 0);
         for (int u = 0; u < unit_count; ++u) {
             const UnitAction& ua = (u == 0) ? a.farmer : a.hands[u - 1];
@@ -974,7 +980,7 @@ __device__ __host__ __forceinline__ void interpreter(
         }
         auto allowed_op = [&](const UnitAction& ua) -> UnitAction {
             UnitAction r = ua;
-            if (ua.op == OP_PLANT && ua.item >= 0 && ua.item < kCrops && plant_demand[ua.item] > priv.seeds[ua.item])
+            if (ua.op == OP_PLANT && ua.item >= 0 && ua.item < kCrops && plant_demand[ua.item] > seeds_snapshot[ua.item])
                 r.op = OP_PASS;
             return r;
         };
