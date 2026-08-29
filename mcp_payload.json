@@ -1,0 +1,17 @@
+{
+  "mcpServers": {
+    "kimi-k2.6-direct": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "mcp-server-openapi",
+        "https://openrouter.ai/api/v1/openapi.json"
+      ],
+      "env": {
+        "OPENROUTER_API_KEY": "sk-or-v1-YOUR-OPENROUTER-KEY-HERE",
+        "API_BASE_URL": "https://openrouter.ai/api/v1",
+        "DEFAULT_MODEL": "moonshotai/kimi-k2.6:free"
+      }
+    }
+  }
+}
