@@ -63,7 +63,7 @@ def download_leaderboard(path: Path) -> None:
         raise RuntimeError(f"Kaggle CLI did not create {path}")
 
 
-def leaderboard_submission_ids(path: Path, limit: int) -> list[str]:
+def leaderboard_submission_ids(path: Path) -> list[str]:
     with path.open(newline="", encoding="utf-8-sig") as stream:
         rows = csv.DictReader(stream)
         normalized = {field.lower(): field for field in rows.fieldnames or []}
@@ -74,8 +74,6 @@ def leaderboard_submission_ids(path: Path, limit: int) -> list[str]:
             match = re.search(r"\d+", value)
             if match and match.group() not in ids:
                 ids.append(match.group())
-            if len(ids) == limit:
-                break
     if not ids:
         columns = ", ".join(rows.fieldnames or [])
         raise RuntimeError(
@@ -120,6 +118,7 @@ def main() -> int:
         replay_ids = [(submission or episode, episode or submission) for submission, episode in explicit_ids if submission or episode]
         replay_ids = []
         for submission_id, episode_id in explicit_ids:
+            time.sleep(args.delay)
             if episode_id:
                 replay_ids.append((submission_id or episode_id, episode_id))
             elif submission_id:
@@ -129,19 +128,22 @@ def main() -> int:
             time.sleep(args.delay)
         if not replay_ids:
             download_leaderboard(args.leaderboard)
-            team_ids = leaderboard_submission_ids(args.leaderboard, args.limit)
+            team_ids = leaderboard_submission_ids(args.leaderboard)
             for team_id in team_ids:
+                time.sleep(args.delay)
                 submissions = json_output(["competitions", "team-submissions", team_id])
                 if isinstance(submissions, list):
                     for submission in submissions:
                         if isinstance(submission, dict) and submission.get("id"):
                             submission_id = str(submission["id"])
+                            time.sleep(args.delay)
                             episode_id = latest_episode_id(submission_id)
                             if episode_id:
-                                replay_ids.append((submission_id, episode_id))
+                                pair = (submission_id, episode_id)
+                                if pair not in replay_ids:
+                                    replay_ids.append(pair)
+                            if len(replay_ids) >= args.limit:
                                 break
-                            time.sleep(args.delay)
-                time.sleep(args.delay)
                 if len(replay_ids) >= args.limit:
                     break
             if not replay_ids:
