@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+"""Download replay artifacts for the top Kaggriculture leaderboard entries.
+
+This intentionally shells out to the official Kaggle CLI instead of calling
+private Kaggle endpoints.  It downloads serially, pauses between requests, and
+can be safely resumed by rerunning it.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+
+COMPETITION = "kaggriculture"
+DEFAULT_DELAY = 2.0
+ID_FIELDS = ("submissionId", "submission_id", "teamId", "team_id")
+
+
+def ids_from_url(value: str) -> tuple[str | None, str | None]:
+    query = parse_qs(urlparse(value).query)
+    submission = query.get("submissionId", [])
+    episode = query.get("episodeId", [])
+    submission_id = submission[0] if submission and submission[0].isdigit() else None
+    episode_id = episode[0] if episode and episode[0].isdigit() else None
+    return submission_id, episode_id
+
+
+def run_kaggle(args: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
+    command = ["kaggle", *args]
+    environment = os.environ.copy()
+    if "KAGGLE_API_TOKEN" in environment:
+        environment["KAGGLE_API_TOKEN"] = environment["KAGGLE_API_TOKEN"].strip()
+    return subprocess.run(command, check=True, text=True, capture_output=capture, env=environment)
+
+
+def download_leaderboard(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return
+    run_kaggle(
+        ["competitions", "leaderboard", COMPETITION, "--download", "--path", str(path.parent), "--quiet"]
+    )
+    downloaded = path.parent / f"{COMPETITION}.csv"
+    archive = path.parent / f"{COMPETITION}.zip"
+    if archive.exists():
+        with zipfile.ZipFile(archive) as bundle:
+            member = next((name for name in bundle.namelist() if name.endswith(".csv")), None)
+            if member:
+                path.write_bytes(bundle.read(member))
+    elif downloaded != path and downloaded.exists():
+        downloaded.replace(path)
+    if not path.exists():
+        raise RuntimeError(f"Kaggle CLI did not create {path}")
+
+
+def leaderboard_submission_ids(path: Path, limit: int) -> list[str]:
+    with path.open(newline="", encoding="utf-8-sig") as stream:
+        rows = csv.DictReader(stream)
+        normalized = {field.lower(): field for field in rows.fieldnames or []}
+        id_fields = [normalized[name.lower()] for name in ID_FIELDS if name.lower() in normalized]
+        ids: list[str] = []
+        for row in rows:
+            value = next((row.get(field, "") for field in id_fields if row.get(field)), "")
+            match = re.search(r"\d+", value)
+            if match and match.group() not in ids:
+                ids.append(match.group())
+            if len(ids) == limit:
+                break
+    if not ids:
+        columns = ", ".join(rows.fieldnames or [])
+        raise RuntimeError(
+            f"{path} has no submission IDs (columns: {columns}). "
+            "The current Kaggle CLI may return teamId; the caller must resolve teams to submissions."
+        )
+    return ids
+
+
+def json_output(args: list[str]) -> object:
+    result = run_kaggle(args + ["--format", "json", "--quiet"], capture=True)
+    return json.loads(result.stdout)
+
+
+def latest_episode_id(submission_id: str) -> str | None:
+    episodes = json_output(["competitions", "episodes", submission_id])
+    if not isinstance(episodes, list):
+        return None
+    for episode in episodes:
+        if isinstance(episode, dict) and episode.get("id"):
+            return str(episode["id"])
+    return None
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--leaderboard-url", action="append", default=[], help="Optional Kaggle leaderboard URL")
+    parser.add_argument("--limit", type=int, default=1500)
+    parser.add_argument("--delay", type=float, default=DEFAULT_DELAY, help="Seconds between downloads")
+    parser.add_argument("--output", type=Path, default=Path("kaggle_replays"))
+    parser.add_argument("--leaderboard", type=Path, default=Path("kaggle_leaderboard.csv"))
+    args = parser.parse_args()
+    if args.limit < 1 or args.delay < 0:
+        parser.error("--limit must be positive and --delay cannot be negative")
+
+    try:
+        explicit_ids = [ids_from_url(url) for url in args.leaderboard_url]
+        replay_ids = [(submission or episode, episode or submission) for submission, episode in explicit_ids if submission or episode]
+        ids = [submission for submission, episode in explicit_ids if submission and not episode]
+        if not ids and not episodes:
+            download_leaderboard(args.leaderboard)
+            team_ids = leaderboard_submission_ids(args.leaderboard, args.limit)
+            for team_id in team_ids:
+                submissions = json_output(["competitions", "team-submissions", team_id])
+                if isinstance(submissions, list):
+                    for submission in submissions:
+                        if isinstance(submission, dict) and submission.get("id"):
+                            submission_id = str(submission["id"])
+                            episode_id = latest_episode_id(submission_id)
+                            if episode_id:
+                                replay_ids.append((submission_id, episode_id))
+                            break
+                time.sleep(args.delay)
+                if len(replay_ids) >= args.limit:
+                    break
+            if not replay_ids:
+                raise RuntimeError("No submissions found for the leaderboard teams")
+        elif ids:
+            replay_ids.extend((submission_id, submission_id) for submission_id in ids)
+
+        args.output.mkdir(parents=True, exist_ok=True)
+        for index, (submission_id, episode_id) in enumerate(replay_ids, start=1):
+            target = args.output / submission_id
+            if target.exists() and any(target.iterdir()):
+                print(f"[{index}/{len(replay_ids)}] already downloaded {submission_id}")
+                continue
+            target.mkdir(parents=True, exist_ok=True)
+            print(f"[{index}/{len(replay_ids)}] downloading submission {submission_id}", flush=True)
+            run_kaggle(["competitions", "replay", episode_id, "--path", str(target), "--quiet"])
+            if index != len(replay_ids):
+                time.sleep(args.delay)
+    except FileNotFoundError:
+        print("kaggle CLI not found; install and authenticate the official Kaggle CLI first.", file=sys.stderr)
+        return 2
+    except subprocess.CalledProcessError as error:
+        print(f"Kaggle CLI failed with exit code {error.returncode}: {error.cmd}", file=sys.stderr)
+        return error.returncode or 1
+    except RuntimeError as error:
+        print(error, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
