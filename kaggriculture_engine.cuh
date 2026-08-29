@@ -203,7 +203,7 @@ __device__ __host__ __forceinline__ int market_price(int item, int inventory) {
         double amp = p.above_target * p.base / shape_fn(p.above_func, p.T, p.T);
         price = p.base - amp * shape_fn(p.above_func, inventory - p.I0, p.T);
     }
-    int rounded = static_cast<int>(lround(price));
+    int rounded = static_cast<int>(nearbyint(price));  // Python round(): ties to even
     return rounded < PRICE_FLOOR ? PRICE_FLOOR : rounded;
 }
 
@@ -245,6 +245,10 @@ struct Private {
     int16_t shed[kItemCount];                 // products + animals
     int16_t seeds[kCrops];
     int16_t inventory[MAX_HANDS + 1][kItemCount]; // [0] = main farmer, [1..] = hands
+    // Insertion-order tracking so drop-to-shed iterates like a Python dict
+    // (insertion-ordered), which is observable once the shed hits capacity.
+    uint8_t inv_order[MAX_HANDS + 1][kItemCount];
+    uint8_t inv_order_len[MAX_HANDS + 1];
 };
 
 struct Market {
@@ -348,8 +352,10 @@ __device__ __host__ __forceinline__ void init_farm(Farm& farm, int starting_mone
 __device__ __host__ __forceinline__ void init_private(Private& p) {
     for (int i = 0; i < kItemCount; ++i) p.shed[i] = 0;
     for (int c = 0; c < kCrops; ++c) p.seeds[c] = 0;
-    for (int u = 0; u <= MAX_HANDS; ++u)
+    for (int u = 0; u <= MAX_HANDS; ++u) {
         for (int i = 0; i < kItemCount; ++i) p.inventory[u][i] = 0;
+        p.inv_order_len[u] = 0;
+    }
 }
 
 __device__ __host__ __forceinline__ void init_market(Market& m) {
@@ -382,17 +388,35 @@ __device__ __host__ __forceinline__ void refresh_prices(Market& m) {
 // ============================================================================
 // INVENTORY HELPERS
 // ============================================================================
-__device__ __host__ __forceinline__ int16_t* unit_inventory(Private& p, int idx) {
-    return p.inventory[idx];  // idx 0 = farmer, 1.. = hands
+// Insertion-order helpers (mirroring a Python dict's ordering for the shed drops).
+__device__ __host__ __forceinline__ void inv_order_remove(Private& priv, int idx, int item) {
+    int len = priv.inv_order_len[idx];
+    for (int i = 0; i < len; ++i) {
+        if (priv.inv_order[idx][i] == item) {
+            for (int j = i; j < len - 1; ++j) priv.inv_order[idx][j] = priv.inv_order[idx][j + 1];
+            priv.inv_order_len[idx] = static_cast<uint8_t>(len - 1);
+            return;
+        }
+    }
 }
 
-__device__ __host__ __forceinline__ void inv_add(int16_t* inv, int item, int n) {
-    inv[item] = static_cast<int16_t>(inv[item] + n);
+__device__ __host__ __forceinline__ void inv_order_append(Private& priv, int idx, int item) {
+    int len = priv.inv_order_len[idx];
+    if (len < kItemCount) {
+        priv.inv_order[idx][len] = static_cast<uint8_t>(item);
+        priv.inv_order_len[idx] = static_cast<uint8_t>(len + 1);
+    }
 }
 
-__device__ __host__ __forceinline__ bool inv_take(int16_t* inv, int item, int n) {
-    if (inv[item] < n) return false;
-    inv[item] = static_cast<int16_t>(inv[item] - n);
+__device__ __host__ __forceinline__ void inv_add(Private& priv, int idx, int item, int n) {
+    if (priv.inventory[idx][item] == 0) inv_order_append(priv, idx, item);
+    priv.inventory[idx][item] = static_cast<int16_t>(priv.inventory[idx][item] + n);
+}
+
+__device__ __host__ __forceinline__ bool inv_take(Private& priv, int idx, int item, int n) {
+    if (priv.inventory[idx][item] < n) return false;
+    priv.inventory[idx][item] = static_cast<int16_t>(priv.inventory[idx][item] - n);
+    if (priv.inventory[idx][item] == 0) inv_order_remove(priv, idx, item);
     return true;
 }
 
@@ -400,6 +424,11 @@ __device__ __host__ __forceinline__ int shed_total(const Private& p) {
     int s = 0;
     for (int i = 0; i < kItemCount; ++i) s += p.shed[i];
     return s;
+}
+
+__device__ __host__ __forceinline__ void inv_zero_all(Private& priv, int idx) {
+    for (int i = 0; i < kItemCount; ++i) priv.inventory[idx][i] = 0;
+    priv.inv_order_len[idx] = 0;
 }
 
 // ============================================================================
@@ -417,7 +446,6 @@ __device__ __host__ __forceinline__ void apply_unit_action(
         if (h >= farm.hand_count) return;
         fx = farm.hand_x[h]; fy = farm.hand_y[h];
     }
-    int16_t* inv = unit_inventory(priv, idx);
 
     // Movement
     if (op == OP_NORTH || op == OP_SOUTH || op == OP_EAST || op == OP_WEST) {
@@ -436,15 +464,18 @@ __device__ __host__ __forceinline__ void apply_unit_action(
     // Shed operations resolve before the LOCKED guard.
     if (op == OP_DROP) {
         if (!is_shed_adjacent(fx, fy)) return;
-        for (int i = 0; i < kItemCount; ++i) {
-            int n = inv[i];
-            if (n <= 0) { inv[i] = 0; continue; }
+        // Drop to shed in INSERTION ORDER (Python dict order), discarding past capacity.
+        for (int oi = 0; oi < priv.inv_order_len[idx]; ++oi) {
+            int i = priv.inv_order[idx][oi];
+            int n = priv.inventory[idx][i];
+            if (n <= 0) { priv.inventory[idx][i] = 0; continue; }
             int room = shed_capacity - shed_total(priv);
             if (room < 0) room = 0;
             int take = n < room ? n : room;
             if (take > 0) priv.shed[i] = static_cast<int16_t>(priv.shed[i] + take);
-            inv[i] = 0;
+            priv.inventory[idx][i] = 0;
         }
+        priv.inv_order_len[idx] = 0;
         return;
     }
     if (op == OP_PICKUP) {
@@ -456,7 +487,7 @@ __device__ __host__ __forceinline__ void apply_unit_action(
         n = n < available ? n : available;
         if (n <= 0) return;
         priv.shed[item] = static_cast<int16_t>(priv.shed[item] - n);
-        inv_add(inv, item, n);
+        inv_add(priv, idx, item, n);
         return;
     }
     if (op == OP_PLACE) {
@@ -465,7 +496,7 @@ __device__ __host__ __forceinline__ void apply_unit_action(
         if (item >= kProducts && item < kItemCount) {
             int animal = item - kProducts;
             if (tile.kind == ANIMALS[animal].structure && tile.animal == 0) {
-                if (inv_take(inv, item, 1)) {
+                if (inv_take(priv, idx, item, 1)) {
                     tile_init_animal(tile, animal, day);
                 }
                 return;
@@ -475,13 +506,14 @@ __device__ __host__ __forceinline__ void apply_unit_action(
         if (is_shed_adjacent(fx, fy)) {
             int n = quantity;
             if (n <= 0) return;
-            if (inv[item] < n) n = inv[item];
+            if (priv.inventory[idx][item] < n) n = priv.inventory[idx][item];
             if (n <= 0) return;
             int room = shed_capacity - shed_total(priv);
             if (room < 0) room = 0;
             if (n > room) n = room;
             if (n <= 0) return;
-            inv[item] = static_cast<int16_t>(inv[item] - n);
+            priv.inventory[idx][item] = static_cast<int16_t>(priv.inventory[idx][item] - n);
+            if (priv.inventory[idx][item] == 0) inv_order_remove(priv, idx, item);
             priv.shed[item] = static_cast<int16_t>(priv.shed[item] + n);
         }
         return;
@@ -522,19 +554,19 @@ __device__ __host__ __forceinline__ void apply_unit_action(
             if (day - tile.planted_day < cd.first_yield_day) return;
             int units = tile.yield_units;
             tile.yield_units = 0;
-            inv_add(inv, tile.crop, units);
+            inv_add(priv, idx, tile.crop, units);
             if (!cd.ongoing) tile_init_empty(tile);
         } else if (tile.animal > 0) {
             int animal = tile.animal - 1;
             int units = tile.yield_units;
             tile.yield_units = 0;
-            inv_add(inv, ANIMALS[animal].product, units);
+            inv_add(priv, idx, ANIMALS[animal].product, units);
         }
         return;
     }
     if (op == OP_FERTILIZE) {
         if (tile.kind != T_PLANT) return;
-        if (!inv_take(inv, P_FERTILIZER, 1)) return;
+        if (!inv_take(priv, idx, P_FERTILIZER, 1)) return;
         int until = day + 2;
         if (tile.fertilized_until_day < until) tile.fertilized_until_day = static_cast<int16_t>(until);
         return;
@@ -560,7 +592,7 @@ __device__ __host__ __forceinline__ void apply_unit_action(
     if (op == OP_FEED) {
         if (tile.animal == 0) return;
         if (tile.fed_today) return;
-        if (!inv_take(inv, P_WHEAT, 1)) return;
+        if (!inv_take(priv, idx, P_WHEAT, 1)) return;
         tile.fed_today = 1;
         return;
     }
@@ -568,7 +600,7 @@ __device__ __host__ __forceinline__ void apply_unit_action(
         if (tile.animal == 0) return;
         if (!tile.fertilizer_available) return;
         tile.fertilizer_available = 0;
-        inv_add(inv, P_FERTILIZER, 1);
+        inv_add(priv, idx, P_FERTILIZER, 1);
         return;
     }
     if (op == OP_CARE) {
@@ -643,20 +675,91 @@ __device__ __host__ __forceinline__ void do_buy_land(Farm& farm) {
 }
 
 // ============================================================================
-// RNG HOOK (patched: simple xorshift, NOT Python's MT19937). Deterministic
-// transitions do not depend on the exact sequence; weeds/shops are loaded from
-// the replay when validating recorded state.
+// RNG: faithful port of CPython's random.Random (MT19937), seeded the same way
+// the official engine does: random.Random((env.info["seed"] * 1000003) ^ day).
+// Matches Python byte-for-byte so weed spawns and shop-unlock draws reproduce.
 // ============================================================================
-__device__ __host__ __forceinline__ uint32_t rng_next(uint32_t& s) {
-    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-    return s;
+struct MtState {
+    uint32_t mt[624];
+    int mti;
+};
+
+__device__ __host__ __forceinline__ void mt_init_genrand(MtState& m, uint32_t s) {
+    m.mt[0] = s;
+    for (int i = 1; i < 624; ++i)
+        m.mt[i] = 1812433253u * (m.mt[i-1] ^ (m.mt[i-1] >> 30)) + static_cast<uint32_t>(i);
+    m.mti = 624;
 }
 
-__device__ __host__ __forceinline__ uint32_t rng_seed(uint32_t episode_seed, int day) {
-    uint32_t s = (episode_seed * 1000003u) ^ static_cast<uint32_t>(day);
-    if (s == 0) s = 1u;
-    return s;
+__device__ __host__ __forceinline__ void mt_init(MtState& m, uint64_t seed) {
+    uint32_t key[8];
+    int keylen = 0;
+    uint64_t t = seed;
+    while (t != 0) { key[keylen++] = static_cast<uint32_t>(t & 0xFFFFFFFFull); t >>= 32; }
+    if (keylen == 0) { key[0] = 0; keylen = 1; }
+    mt_init_genrand(m, 19650218u);
+    int i = 1, j = 0;
+    int k = 624 > keylen ? 624 : keylen;
+    for (; k; --k) {
+        m.mt[i] = (m.mt[i] ^ ((m.mt[i-1] ^ (m.mt[i-1] >> 30)) * 1664525u)) + key[j] + static_cast<uint32_t>(j);
+        ++i; ++j;
+        if (i >= 624) { m.mt[0] = m.mt[623]; i = 1; }
+        if (j >= keylen) j = 0;
+    }
+    for (k = 623; k; --k) {
+        m.mt[i] = (m.mt[i] ^ ((m.mt[i-1] ^ (m.mt[i-1] >> 30)) * 1566083941u)) - static_cast<uint32_t>(i);
+        ++i;
+        if (i >= 624) { m.mt[0] = m.mt[623]; i = 1; }
+    }
+    m.mt[0] = 0x80000000u;
+    m.mti = 624;
 }
+
+__device__ __host__ __forceinline__ uint32_t mt_genrand(MtState& m) {
+    if (m.mti >= 624) {
+        int i;
+        for (i = 0; i < 227; ++i) {
+            uint32_t y = (m.mt[i] & 0x80000000u) | (m.mt[i+1] & 0x7fffffffu);
+            m.mt[i] = m.mt[i+397] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        }
+        for (; i < 623; ++i) {
+            uint32_t y = (m.mt[i] & 0x80000000u) | (m.mt[i+1] & 0x7fffffffu);
+            m.mt[i] = m.mt[i-227] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        }
+        uint32_t y = (m.mt[623] & 0x80000000u) | (m.mt[0] & 0x7fffffffu);
+        m.mt[623] = m.mt[396] ^ (y >> 1) ^ ((y & 1u) ? 0x9908b0dfu : 0u);
+        m.mti = 0;
+    }
+    uint32_t y = m.mt[m.mti++];
+    y ^= (y >> 11);
+    y ^= (y << 7) & 0x9d2c5680u;
+    y ^= (y << 15) & 0xefc60000u;
+    y ^= (y >> 18);
+    return y;
+}
+
+__device__ __host__ __forceinline__ double mt_random(MtState& m) {
+    uint32_t a = mt_genrand(m) >> 5;
+    uint32_t b = mt_genrand(m) >> 6;
+    return (a * 67108864.0 + b) * (1.0 / 9007199254740992.0);
+}
+
+// _randbelow(n): rejection sample from getrandbits(bit_length(n)).
+__device__ __host__ __forceinline__ int mt_randbelow(MtState& m, int n) {
+    int k = 0;
+    while ((1u << k) <= static_cast<uint32_t>(n)) ++k;
+    uint32_t r;
+    do { r = mt_genrand(m) >> (32 - k); } while (r >= static_cast<uint32_t>(n));
+    return static_cast<int>(r);
+}
+
+__device__ __host__ __forceinline__ uint64_t rng_seed(uint32_t episode_seed, int day) {
+    return (static_cast<uint64_t>(episode_seed) * 1000003ull) ^ static_cast<uint64_t>(day);
+}
+
+// sorted(SHOPS.keys()) -> enum index, since rng.choice(sorted(SHOPS)) draws from
+// the alphabetically sorted name list.
+__device__ __host__ constexpr uint8_t SHOP_SORTED_TO_ENUM[kShops] = {0, 2, 7, 4, 5, 1, 6, 3};
 
 // ============================================================================
 // MARKET ORDER PROCESSING. Mirrors _process_market / _commit_unit / _parse_order.
@@ -882,31 +985,31 @@ __device__ __host__ __forceinline__ void daily_refresh_animals(Farm& farm, int d
 // ============================================================================
 __device__ __host__ __forceinline__ void drop_inventories_to_shed(Private& priv, int capacity) {
     for (int u = 0; u <= MAX_HANDS; ++u) {
-        int16_t* inv = priv.inventory[u];
-        for (int i = 0; i < kItemCount; ++i) {
-            int n = inv[i];
-            if (n <= 0) { inv[i] = 0; continue; }
+        // Drop in insertion order, discarding past capacity.
+        for (int oi = 0; oi < priv.inv_order_len[u]; ++oi) {
+            int i = priv.inv_order[u][oi];
+            int n = priv.inventory[u][i];
+            if (n <= 0) { priv.inventory[u][i] = 0; continue; }
             int room = capacity - shed_total(priv);
             if (room < 0) room = 0;
             int take = n < room ? n : room;
             if (take > 0) priv.shed[i] = static_cast<int16_t>(priv.shed[i] + take);
-            inv[i] = 0;
+            priv.inventory[u][i] = 0;
         }
+        priv.inv_order_len[u] = 0;
     }
 }
 
-__device__ __host__ __forceinline__ void spawn_weeds(Farm& farm, float weed_chance, uint32_t& rng) {
+__device__ __host__ __forceinline__ void spawn_weeds(Farm& farm, float weed_chance, MtState& rng) {
     for (int t = 0; t < BOARD_TILES; ++t) {
         if (farm.tiles[t].kind != T_EMPTY) continue;
-        // Patched RNG: uniform-ish draw from xorshift, top 24 bits.
-        float draw = static_cast<float>(rng_next(rng) >> 8) / 16777216.0f;
-        if (draw < weed_chance) tile_init_weed(farm.tiles[t]);
+        if (mt_random(rng) < weed_chance) tile_init_weed(farm.tiles[t]);
     }
 }
 
 __device__ __host__ __forceinline__ void end_of_day(
     GameState& s, int day, int turns_per_day, float weed_chance,
-    int shed_capacity, int shop_interval, uint32_t& rng)
+    int shed_capacity, int shop_interval, MtState& rng)
 {
     int half = BOARD_SIZE / 2;
     for (int p = 0; p < NUM_PLAYERS; ++p) {
@@ -921,15 +1024,17 @@ __device__ __host__ __forceinline__ void end_of_day(
         farm.hand_count = 0;
         farm.hires_today = 0;
         for (int h = 0; h < MAX_HANDS; ++h) { farm.hand_x[h] = 0; farm.hand_y[h] = 0; }
-        for (int u = 0; u <= MAX_HANDS; ++u)
+        for (int u = 0; u <= MAX_HANDS; ++u) {
             for (int i = 0; i < kItemCount; ++i) priv.inventory[u][i] = 0;
+            priv.inv_order_len[u] = 0;
+        }
     }
     int next_day = day + 1;
     if (next_day > 0 && next_day % shop_interval == 0) {
         if (s.town.shop_count < MAX_SHOP_INSTANCES) {
-            // Patched RNG: draw a shop index in [0, kShops) from xorshift.
-            int shop = static_cast<int>(rng_next(rng) % kShops);
-            s.town.unlocked_shops[s.town.shop_count++] = static_cast<uint8_t>(shop);
+            // rng.choice(sorted(SHOPS)): draw a sorted-name index, map to enum.
+            int sorted_idx = mt_randbelow(rng, kShops);
+            s.town.unlocked_shops[s.town.shop_count++] = SHOP_SORTED_TO_ENUM[sorted_idx];
         }
     }
 }
@@ -1006,7 +1111,8 @@ __device__ __host__ __forceinline__ void interpreter(
     for (int p = 0; p < NUM_PLAYERS; ++p) decay_plants(s.farms[p], step);
 
     if ((step + 1) % turns_per_day == 0) {
-        uint32_t rng = rng_seed(episode_seed, day);
+        MtState rng;
+        mt_init(rng, rng_seed(episode_seed, day));
         end_of_day(s, day, turns_per_day, WEED_SPAWN_CHANCE, shed_capacity,
                    TOWN_SHOP_UNLOCK_INTERVAL, rng);
     }
