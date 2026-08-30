@@ -34,7 +34,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
+#include <map>
 #include <vector>
 #include <algorithm>
 
@@ -63,23 +63,23 @@
 // PROTOCOL CONSTANTS
 // ============================================================================
 namespace proto {
-__device__ constexpr int kBoardSize      = 10;
-__device__ constexpr int kBoardTiles     = 100;
-__device__ constexpr int kMaskWords      = 4;   // ceil(100/32)
-__device__ constexpr int kPlayers        = 2;
-__device__ constexpr int kSteps          = 720;
-__device__ constexpr int kDays           = 30;
-__device__ constexpr int kHoursPerDay    = 24;
-__device__ constexpr int kProducts       = 9;
-__device__ constexpr int kCrops          = 5;
-__device__ constexpr int kAnimals        = 3;
-__device__ constexpr int kShops          = 8;
-__device__ constexpr int kMaxHands       = 16;
-__device__ constexpr int kMarketOrders   = 10;
-__device__ constexpr int kMaxActionTokens = 8;
-__device__ constexpr char kReplayName[]   = "kaggriculture";
-__device__ constexpr char kReplayModule[] = "1.32.7";
-__device__ constexpr int kStartingMoney  = 3000;
+constexpr int kBoardSize      = 10;
+constexpr int kBoardTiles     = 100;
+constexpr int kMaskWords      = 4;   // ceil(100/32)
+constexpr int kPlayers        = 2;
+constexpr int kSteps          = 720;
+constexpr int kDays           = 30;
+constexpr int kHoursPerDay    = 24;
+constexpr int kProducts       = 9;
+constexpr int kCrops          = 5;
+constexpr int kAnimals        = 3;
+constexpr int kShops          = 8;
+constexpr int kMaxHands       = 16;
+constexpr int kMarketOrders   = 10;
+constexpr int kMaxActionTokens = 8;
+constexpr char kReplayName[]   = "kaggriculture";
+constexpr char kReplayModule[] = "1.32.7";
+constexpr int kStartingMoney  = 3000;
 
 // Official actions (must match replay JSON exactly)
 enum Action : uint8_t {
@@ -110,15 +110,15 @@ static const char* const kShopNames[kShops] = {
 __device__ constexpr uint8_t kQuadNW = 1, kQuadNE = 2, kQuadSW = 4, kQuadSE = 8;
 
 // Seed costs (from official game)
-__device__ constexpr int kSeedCost[kCrops] = {10, 20, 50, 80, 100};
+__device__ __host__ constexpr int kSeedCost[kCrops] = {10, 20, 50, 80, 100};
 
 // Shop unlock costs
-__device__ constexpr int kShopCost[kShops] = {25, 40, 55, 70, 85, 100, 125, 150};
+__device__ __host__ constexpr int kShopCost[kShops] = {25, 40, 55, 70, 85, 100, 125, 150};
 
 // Crop growth parameters
-__device__ constexpr int kCropGrowthDays[kCrops] = {3, 4, 5, 6, 7};  // days to mature
-__device__ constexpr int kCropMaxYield[kCrops]   = {2, 3, 4, 5, 6};   // max yield at harvest
-__device__ constexpr int kUnwateredDeathDays    = 2;  // days without water before death
+__device__ __host__ constexpr int kCropGrowthDays[kCrops] = {3, 4, 5, 6, 7};  // days to mature
+__device__ __host__ constexpr int kCropMaxYield[kCrops]   = {2, 3, 4, 5, 6};   // max yield at harvest
+__device__ __host__ constexpr int kUnwateredDeathDays    = 2;  // days without water before death
 
 // Base market prices
  __constant__ float kBasePrice[kProducts] = {
@@ -1081,8 +1081,8 @@ __global__ void smoke_test_kernel(int* results) {
     // Test 6: Water flag should be reset
     results[5] = !bp_test(state.farm.hot.watered_today, tile) ? 1 : 0;
 
-    // Test 7: Buy seed action
-    state.hot_econ.money = 100.0f;
+    // Test 7: Buy seed action (money between wheat cost [10] and melon cost [100])
+    state.hot_econ.money = 80.0f;
     bool legal[kActions];
     compute_legal_mask(&state, legal);
     results[6] = legal[IA_BuyWheatSeed] ? 1 : 0;
@@ -1106,7 +1106,7 @@ struct JsonValue {
     bool boolean = false;
     std::string string;
     std::vector<JsonValue> array;
-    std::unordered_map<std::string, JsonValue> object;
+    std::map<std::string, JsonValue> object;
 
     const JsonValue& get(const char* key) const {
         if (type != Object) throw JsonError("expected object for: " + std::string(key));

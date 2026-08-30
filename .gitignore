@@ -1,0 +1,9 @@
+# Downloaded Kaggle replay data (large, regenerable via download_kaggle_replays.py)
+kaggle_replays/
+kaggle_leaderboard.csv
+*.zip
+replays.csv
+
+# Python
+__pycache__/
+*.pyc
