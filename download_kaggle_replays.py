@@ -20,9 +20,11 @@ import zipfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
+
 COMPETITION = "kaggriculture"
 DEFAULT_DELAY = 2.0
 ID_FIELDS = ("submissionId", "submission_id", "teamId", "team_id")
+
 
 def ids_from_url(value: str) -> tuple[str | None, str | None]:
     query = parse_qs(urlparse(value).query)
@@ -32,12 +34,14 @@ def ids_from_url(value: str) -> tuple[str | None, str | None]:
     episode_id = episode[0] if episode and episode[0].isdigit() else None
     return submission_id, episode_id
 
+
 def run_kaggle(args: list[str], *, capture: bool = False) -> subprocess.CompletedProcess[str]:
     command = ["kaggle", *args]
     environment = os.environ.copy()
     if "KAGGLE_API_TOKEN" in environment:
         environment["KAGGLE_API_TOKEN"] = environment["KAGGLE_API_TOKEN"].strip()
     return subprocess.run(command, check=True, text=True, capture_output=capture, env=environment)
+
 
 def download_leaderboard(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -58,6 +62,7 @@ def download_leaderboard(path: Path) -> None:
     if not path.exists():
         raise RuntimeError(f"Kaggle CLI did not create {path}")
 
+
 def leaderboard_teams(path: Path) -> list[tuple[str, str]]:
     with path.open(newline="", encoding="utf-8-sig") as stream:
         rows = csv.DictReader(stream)
@@ -77,9 +82,11 @@ def leaderboard_teams(path: Path) -> list[tuple[str, str]]:
         )
     return teams
 
+
 def json_output(args: list[str]) -> object:
     result = run_kaggle(args + ["--format", "json", "--quiet"], capture=True)
     return json.loads(result.stdout)
+
 
 def latest_episode_id(submission_id: str) -> str | None:
     episodes = json_output(["competitions", "episodes", submission_id])
@@ -90,8 +97,10 @@ def latest_episode_id(submission_id: str) -> str | None:
             return str(episode["id"])
     return None
 
+
 def replay_file(directory: Path, episode_id: str) -> Path:
     return directory / f"episode-{episode_id}-replay.json"
+
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -165,6 +174,7 @@ def main() -> int:
         print(error, file=sys.stderr)
         return 1
     return 0
+
 
 if __name__ == "__main__":
     raise SystemExit(main())
